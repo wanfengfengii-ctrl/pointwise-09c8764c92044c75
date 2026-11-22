@@ -3,7 +3,7 @@ import sqlite3
 
 from warehouse.intake.provenance import SourceReference
 from warehouse.intake.validate import validate_litres
-from warehouse.ledger.facts import observations_at
+from warehouse.ledger.facts import observations_at, retirement_counts
 from warehouse.ledger.journal import FormalEdition, districts_for_day, list_formal_editions, require_formal_edition
 from warehouse.ledger.membership import memberships_at
 
@@ -51,6 +51,10 @@ def _verify_complete_prefix(
         ))
         if actual_counts != expected_counts:
             raise RuntimeError(f'incomplete {table} for {edition.day} edition {edition.number}')
+    expected_retirements = {item.number: item.retired_count for item in prefix if item.retired_count}
+    if retirement_counts(db, edition.day, edition.number) != expected_retirements:
+        raise RuntimeError(
+            f'incomplete observation_retirements for {edition.day} edition {edition.number}')
 
 
 def project_day(

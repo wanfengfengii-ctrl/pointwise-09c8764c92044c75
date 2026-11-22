@@ -2,8 +2,9 @@ from dataclasses import dataclass
 import sqlite3
 
 from warehouse.edition.changes import DistrictChange
-from warehouse.intake.provenance import reference_to_text
+from warehouse.intake.provenance import SourceReference, reference_from_text, reference_to_text
 from warehouse.intake.validate import validate_day
+from warehouse.ledger.evidence import decode_origins, encode_origins, origins_for_ordinary
 from warehouse.ledger.journal import store_owner
 
 
@@ -15,9 +16,21 @@ CREATE TABLE IF NOT EXISTS district_balance (
     station TEXT NOT NULL,
     litres INTEGER NOT NULL,
     source TEXT NOT NULL,
+    origins TEXT NOT NULL DEFAULT '[]',
+    allocatable INTEGER NOT NULL DEFAULT 1,
     PRIMARY KEY (day, district, observation)
 )
 '''
+
+
+@dataclass(frozen=True)
+class BalanceRow:
+    observation: str
+    station: str
+    litres: int
+    source: SourceReference
+    origins: tuple[tuple[SourceReference, int], ...]
+    allocatable: bool
 
 
 @dataclass(frozen=True)
@@ -42,9 +55,22 @@ def read_balance(db: sqlite3.Connection, day: str, district: str) -> BalanceMeas
     return BalanceMeasure(count, total)
 
 
+def balance_rows(db: sqlite3.Connection, day: str, district: str) -> dict[str, BalanceRow]:
+    rows = {}
+    for observation, station, litres, source, origins, allocatable in db.execute(
+        '''SELECT observation, station, litres, source, origins, allocatable
+           FROM district_balance WHERE day = ? AND district = ?''', (day, district),
+    ):
+        rows[observation] = BalanceRow(observation, station, litres, reference_from_text(source),
+                                       decode_origins(origins), bool(allocatable))
+    return rows
+
+
 def apply_district_changes(
-    db: sqlite3.Connection, day: str, district: str, changes: tuple[DistrictChange, ...]
+    db: sqlite3.Connection, day: str, district: str, changes: tuple[DistrictChange, ...],
+    evidence: dict[str, tuple[tuple[tuple[SourceReference, int], ...], bool]] | None = None,
 ) -> BalanceMeasure:
+    evidence = evidence or {}
     for change in changes:
         arguments = (day, district, change.observation, change.station,
                      change.litres, reference_to_text(change.source))
@@ -56,10 +82,14 @@ def apply_district_changes(
             if result.rowcount != 1:
                 raise ValueError(f'exit has no exact prior row: {change.observation}')
         else:
+            origins, allocatable = evidence.get(
+                change.observation,
+                (origins_for_ordinary(change.source, change.litres), True))
             result = db.execute(
-                '''INSERT INTO district_balance (day, district, observation, station, litres, source)
-                   VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(day, district, observation) DO NOTHING''',
-                arguments,
+                '''INSERT INTO district_balance
+                   (day, district, observation, station, litres, source, origins, allocatable)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(day, district, observation) DO NOTHING''',
+                (*arguments, encode_origins(origins), int(allocatable)),
             )
             if result.rowcount != 1:
                 raise ValueError(f'entry would replace an existing row: {change.observation}')

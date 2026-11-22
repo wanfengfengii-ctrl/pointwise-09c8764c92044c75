@@ -38,6 +38,7 @@ class FormalEdition:
     request_id: str
     fact_count: int
     membership_count: int
+    retired_count: int = 0
 
     @property
     def previous(self) -> int:
@@ -61,10 +62,17 @@ def open_store(
                 raise ValueError('warehouse file is already bound to a different owner')
             for schema in schemas:
                 db.execute(schema)
+            _upgrade_journal(db)
     except BaseException:
         db.close()
         raise
     return db
+
+
+def _upgrade_journal(db: sqlite3.Connection) -> None:
+    columns = {row[1] for row in db.execute('PRAGMA table_info(formal_editions)')}
+    if columns and 'retired_count' not in columns:
+        db.execute('ALTER TABLE formal_editions ADD COLUMN retired_count INTEGER NOT NULL DEFAULT 0')
 
 
 def store_owner(db: sqlite3.Connection) -> tuple[str, str]:
@@ -88,28 +96,34 @@ def districts_for_day(db: sqlite3.Connection, day: str) -> tuple[str, ...]:
 def record_formal_edition(db: sqlite3.Connection, edition: FormalEdition) -> None:
     require_positive_integer(edition.number, 'formal edition')
     db.execute(
-        '''INSERT INTO formal_editions (day, number, request_id, fact_count, membership_count)
-           VALUES (?, ?, ?, ?, ?)''',
-        (edition.day, edition.number, edition.request_id, edition.fact_count, edition.membership_count),
+        '''INSERT INTO formal_editions
+           (day, number, request_id, fact_count, membership_count, retired_count)
+           VALUES (?, ?, ?, ?, ?, ?)''',
+        (edition.day, edition.number, edition.request_id, edition.fact_count,
+         edition.membership_count, edition.retired_count),
     )
+
+
+def _edition(row) -> FormalEdition:
+    return FormalEdition(*row)
 
 
 def require_formal_edition(db: sqlite3.Connection, day: str, number: int) -> FormalEdition:
     validate_day(day)
     require_positive_integer(number, 'formal edition')
     row = db.execute(
-        '''SELECT day, number, request_id, fact_count, membership_count
+        '''SELECT day, number, request_id, fact_count, membership_count, retired_count
            FROM formal_editions WHERE day = ? AND number = ?''', (day, number),
     ).fetchone()
     if row is None:
         raise LookupError(f'no formal edition {number} for {day}')
-    return FormalEdition(*row)
+    return _edition(row)
 
 
 def list_formal_editions(db: sqlite3.Connection, day: str) -> tuple[FormalEdition, ...]:
     validate_day(day)
     rows = db.execute(
-        '''SELECT day, number, request_id, fact_count, membership_count
+        '''SELECT day, number, request_id, fact_count, membership_count, retired_count
            FROM formal_editions WHERE day = ? ORDER BY number''', (day,),
     )
-    return tuple(FormalEdition(*row) for row in rows)
+    return tuple(_edition(row) for row in rows)

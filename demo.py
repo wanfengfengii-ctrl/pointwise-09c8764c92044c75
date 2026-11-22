@@ -3,7 +3,7 @@ import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from warehouse import CorrectionBatch, MembershipInput, ObservationInput, OpeningBatch, SourcePosition, ValueCorrection, apply_batch, encode_edition, expire_input, open_day, open_district, open_source, read_edition, receive_edition, release_edition
+from warehouse import CorrectionBatch, MembershipInput, ObservationInput, OpeningBatch, ReplacementBatch, SourcePosition, SourceReference, ValueCorrection, apply_batch, apply_replacement, encode_edition, expire_input, open_day, open_district, open_source, read_balance, read_edition, read_replacement_origins, receive_edition, release_edition
 from warehouse.intake.source_rows import list_expired_rows
 
 
@@ -96,6 +96,104 @@ def main() -> None:
             'oracle': '东区手算 7−7=0，西区手算 0+11=11。晨报和更正各有一条观测行和一条站区行。退出指向晨报第 1 行，进入指向更正第 4 行。',
         }
         print('POINTWISE_SCENARIO ' + json.dumps(evidence, ensure_ascii=False, sort_keys=True))
+        _replacement_demo(root)
+
+
+def _replacement_demo(root: Path) -> None:
+    orders = json.loads(Path(__file__).with_name('replacement-orders.json').read_text(encoding='utf-8'))
+    day, station = orders['day'], orders['station']
+    districts = tuple(orders['districts'])
+
+    def position(value):
+        return SourcePosition(value[0], value[1])
+
+    def reference(value):
+        return SourceReference(day, value[0], value[1], SourcePosition(value[2], value[3]))
+
+    def observations(items):
+        return tuple(ObservationInput(key, station, litres, position(row)) for key, litres, row in items)
+
+    def order(spec, allocation_key='allocations'):
+        allocations = spec[allocation_key] if allocation_key in spec else orders[allocation_key]
+        return ReplacementBatch(
+            day, spec['request_id'], station,
+            tuple((key, reference(value)) for key, value in spec['retired']),
+            observations(spec['new']),
+            tuple((retired, new, reference(origin), litres)
+                  for retired, new, origin, litres in allocations))
+
+    def opening():
+        source = orders['opening']
+        return OpeningBatch(day, source['request_id'], districts, observations(source['observations']),
+                            (MembershipInput(station, source['district'],
+                                             position(source['membership_position'])),))
+
+    with closing(open_source(root / 'replacement-source.sqlite')) as source:
+        open_day(source, opening())
+        first = apply_replacement(source, order(orders['orders'][0]))
+        rejected = False
+        try:
+            apply_replacement(source, order(orders['orders'][1], 'bad_second_allocations'))
+        except ValueError:
+            rejected = True
+        second = apply_replacement(source, order(orders['orders'][1]))
+        payloads = {(district, number): encode_edition(release_edition(source, day, district, number))
+                    for district in districts for number in (1, 2, 3)}
+        expired = expire_input(source, day, 3)
+    assert rejected, 'the mis-allocated order must be rejected'
+    assert expired.blocked == () and expired.removed == 7, expired
+    assert (first.edition, second.edition) == (2, 3)
+    assert {projection.district: projection.total_litres for projection in second.projections} == {
+        'east': 12, 'west': 0}
+
+    with closing(open_source(root / 'replacement-alternate.sqlite')) as alternate:
+        open_day(alternate, opening())
+        apply_replacement(alternate, order(orders['orders'][0], 'alternate_first_allocations'))
+        apply_replacement(alternate, order(orders['orders'][1], 'bad_second_allocations'))
+        forged = encode_edition(release_edition(alternate, day, 'east', 3))
+
+    east = root / 'replacement-east.sqlite'
+    with closing(open_district(east, 'east')) as local:
+        receive_edition(local, payloads['east', 1])
+        late = receive_edition(local, payloads['east', 3])
+        assert (late.status, late.frontier, late.completed) == ('pending', 1, ())
+        finish = receive_edition(local, payloads['east', 2])
+        completed = [(result.edition, result.total_litres) for result in finish.completed]
+        rejected_by_district = False
+        try:
+            receive_edition(local, forged)
+        except ValueError:
+            rejected_by_district = True
+        assert rejected_by_district, 'the district must reject the forged allocation'
+        assert [(result.edition, result.total_litres) for result in finish.completed] == completed
+    with closing(open_district(east, 'east')) as local:
+        origins = {key: [(origin.edition, origin.position.document, origin.position.row, litres)
+                         for origin, litres in read_replacement_origins(local, day, 'east', 3, key)]
+                   for key in ('e', 'f')}
+        receipt = read_edition(local, day, 'east', 2).receipt
+        balance = read_balance(local, day, 'east')
+        replay = receive_edition(local, payloads['east', 2])
+    assert completed == [(2, 12), (3, 12)], completed
+    assert origins['e'] == [(1, 'morning.csv', 1, 3)], origins
+    assert origins['f'] == [(1, 'morning.csv', 1, 4), (1, 'morning.csv', 2, 5)], origins
+    assert (balance.row_count, balance.total_litres) == (2, 12)
+    assert replay.receipt == receipt and replay.completed == ()
+    print(f'{day} 换表复核：第 2、3 刊东区各 {balance.total_litres} L，'
+          f'错拨工单已拒收，清理原始行 {expired.removed} 条。')
+    evidence = {
+        'case_id': 'V9', 'input': orders,
+        'expected': {'editions': [2, 3], 'east_litres': 12, 'out_of_order': [[2, 12], [3, 12]],
+                     'bad_order': 'rejected', 'district_rejected_forged': True, 'origins': origins},
+        'actual': {'editions': [first.edition, second.edition],
+                   'east_litres': balance.total_litres, 'out_of_order': completed,
+                   'bad_order': 'rejected' if rejected else 'accepted',
+                   'district_rejected_forged': rejected_by_district, 'origins': origins},
+        'code_paths': ['warehouse/ledger/replacement.py', 'warehouse/edition/publish.py',
+                       'warehouse/district/origins.py', 'warehouse/district/advance.py'],
+        'oracle': '第 2 刊 c=原 a 1 L+原 b 5 L、d=原 a 6 L；第 3 刊 e=原 a 3 L、f=原 a 4 L+原 b 5 L；'
+                  '东区三刊均为 12 L。错拨单把 c 的 1 L 报成 3 L，源仓与区仓都拒收。',
+    }
+    print('POINTWISE_SCENARIO ' + json.dumps(evidence, ensure_ascii=False, sort_keys=True))
 
 
 if __name__ == '__main__':
