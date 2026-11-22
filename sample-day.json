@@ -1,0 +1,14 @@
+{
+  "day": "2026-02-03",
+  "districts": ["east", "west"],
+  "opening": {
+    "request": "morning",
+    "observations": [{"observation": "a", "station": "bend", "litres": 7, "position": {"document": "morning.csv", "row": 1}}],
+    "memberships": [{"station": "bend", "district": "east", "position": {"document": "stations.csv", "row": 1}}]
+  },
+  "correction": {
+    "request": "fix",
+    "observations": [{"observation": "a", "litres": 11, "position": {"document": "fix-observations.csv", "row": 4}}],
+    "memberships": [{"station": "bend", "district": "west", "position": {"document": "fix-stations.csv", "row": 3}}]
+  }
+}
